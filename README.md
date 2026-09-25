@@ -40,6 +40,12 @@ reachable and every configured model file is actually visible to its loader.
 > its sandboxed Python can shadow the venv's real interpreter. Run it from a normal
 > terminal (or PyCharm's Terminal panel) instead.
 
+> **Always start both processes yourself, in your own terminals.** If something
+> else launches ComfyUI on your behalf (an assistant, a script, an IDE task) and
+> that thing's own process later dies or restarts, ComfyUI dies with it —
+> silently, mid-generation, with no warning in the UI. Running it in a terminal
+> you own is what keeps a multi-hour render safe.
+
 ## Negative prompt
 
 Every tab has a default negative prompt baked in so a blank field doesn't produce
@@ -88,7 +94,24 @@ For quick iteration on a prompt, drop Steps to ~8 (Wan) or ~4 (LTX) and Frames t
 before committing to a full-quality render.
 
 The terminal running ComfyUI shows a live progress bar with `s/it` — multiply that
-by remaining steps for a real-time ETA.
+by remaining steps for a real-time ETA. The web UI itself also shows a live
+progress bar (step count, `s/it`, ETA) while a job runs, fed over ComfyUI's
+websocket — you don't need to watch the terminal.
+
+## Seeing past runs
+
+Every generation you start — including ones that errored or got interrupted
+(e.g. ComfyUI crashed mid-render) — is appended to `runs.jsonl` in the project
+root. This is separate from the browser: reloading the page, restarting the
+app, or even restarting ComfyUI doesn't lose this history, since it's just a
+file on disk.
+
+The **History** tab lists it: timestamp, which tab/model was used, the prompt,
+settings, and a status column that tells you how far a run actually got —
+`done (30 steps)`, `error at 12/30`, or `interrupted at 9/30 (process
+stopped)` for one where ComfyUI itself died before it could report back.
+Pick a filename from the dropdown and hit **Load** to preview it — every
+output is also sitting directly in `./outputs/` if you'd rather browse there.
 
 ## Offline
 

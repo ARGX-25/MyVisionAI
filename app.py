@@ -20,7 +20,45 @@ COMFY_URL = "http://127.0.0.1:8188"
 COMFY_WS_URL = "ws://127.0.0.1:8188/ws"
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+RUNS_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs.jsonl")
 CLIENT_ID = str(uuid.uuid4())
+
+
+def log_run(record):
+    """Append one line to the persistent run log. Never raises."""
+    try:
+        with open(RUNS_LOG, "a") as f:
+            f.write(json.dumps({"ts": time.time(), **record}) + "\n")
+    except Exception:
+        pass
+
+
+def read_runs(limit=100):
+    """Latest record per run_id (a run logs a 'running' row, then a final
+    'success'/'error' row with the same run_id — this collapses to one row
+    per run, newest first). A 'running' row with no follow-up means the
+    process died mid-run (e.g. ComfyUI or app.py was killed) rather than
+    finishing or raising cleanly."""
+    latest = {}
+    order = []
+    if not os.path.exists(RUNS_LOG):
+        return []
+    with open(RUNS_LOG) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            rid = rec.get("run_id", rec.get("ts"))
+            if rid not in latest:
+                order.append(rid)
+            latest[rid] = rec
+    rows = [latest[rid] for rid in order]
+    rows.sort(key=lambda r: r.get("ts", 0), reverse=True)
+    return rows[:limit]
 
 # ---------------------------------------------------------------------------
 # Model files — edit these to match what's in your ComfyUI models/ folders.
@@ -190,10 +228,11 @@ class ComfyClient:
             time.sleep(poll)
         raise ComfyError("Timed out waiting for ComfyUI to finish.")
 
-    def run_with_progress(self, graph, progress_cb=None, timeout=3600):
+    def run_with_progress(self, graph, progress_cb=None, on_queued=None, timeout=3600):
         """Queue a graph and stream live step progress over ComfyUI's websocket.
 
         progress_cb(value, max_value, rate_s_per_it) is called on every step tick.
+        on_queued(prompt_id) is called right after the job is accepted.
         Returns the finished /history entry, same shape as wait().
         """
         ws = websocket.WebSocket()
@@ -203,6 +242,8 @@ class ComfyClient:
             raise ComfyError(f"Can't open a websocket to ComfyUI at {self.base}: {e}")
         try:
             prompt_id = self.queue(graph)
+            if on_queued:
+                on_queued(prompt_id)
             start = time.time()
             step_times = []
             last_tick = start
@@ -214,6 +255,10 @@ class ComfyClient:
                     raw = ws.recv()
                 except websocket.WebSocketTimeoutException:
                     continue
+                except Exception as e:
+                    raise ComfyError(f"Lost connection to ComfyUI mid-run (it may have crashed or been restarted): {e}")
+                if raw == "":
+                    raise ComfyError("ComfyUI closed the connection mid-run (it may have crashed or been restarted).")
                 if not isinstance(raw, str):
                     continue  # binary preview frame, skip
                 try:
@@ -224,7 +269,10 @@ class ComfyClient:
                 if mtype == "progress_state" and d.get("prompt_id") == prompt_id:
                     running = [n for n in d.get("nodes", {}).values() if n.get("state") == "running"]
                     if running and progress_cb:
-                        node = running[0]
+                        # Several nodes can be "running" near the tail end (sampler
+                        # wrapping up, VAE decode starting); the sampler is the one
+                        # with the largest step count, so prefer that one.
+                        node = max(running, key=lambda n: n.get("max", 1) or 1)
                         value, mx = node.get("value", 0), node.get("max", 1) or 1
                         now = time.time()
                         if value > 0:
@@ -294,8 +342,22 @@ def center_crop_to_aspect(img, width, height):
     return img.resize((width, height), Image.LANCZOS)
 
 
-def run_and_collect(graph, seed_used, width, height, frames, gr_progress=None):
+def run_and_collect(graph, seed_used, width, height, frames, steps, cfg, fps,
+                     gr_progress=None, mode="", model="", prompt_text=""):
+    run_id = uuid.uuid4().hex[:8]
+    state = {"value": 0, "max": steps, "prompt_id": None}
+    base = dict(
+        run_id=run_id, mode=mode, model=model, prompt=(prompt_text or "")[:200],
+        width=width, height=height, frames=frames, steps=steps, cfg=cfg,
+        fps=fps, seed=seed_used,
+    )
+
+    def on_queued(prompt_id):
+        state["prompt_id"] = prompt_id
+        log_run({**base, "status": "running", "comfy_prompt_id": prompt_id, "step": 0, "total_steps": steps})
+
     def on_tick(value, mx, rate):
+        state["value"], state["max"] = value, mx
         if gr_progress is None:
             return
         eta = rate * (mx - value)
@@ -308,12 +370,21 @@ def run_and_collect(graph, seed_used, width, height, frames, gr_progress=None):
 
     if gr_progress is not None:
         gr_progress(0, desc=f"Queuing · {frames} frames @ {width}x{height}")
-    entry = client.run_with_progress(graph, progress_cb=on_tick)
+    try:
+        entry = client.run_with_progress(graph, progress_cb=on_tick, on_queued=on_queued)
+    except ComfyError as e:
+        log_run({**base, "status": "error", "error": str(e), "step": state["value"], "total_steps": max(state["max"], steps)})
+        raise
     files = client.fetch_outputs(entry)
     videos = [f for f in files if f.lower().endswith((".mp4", ".webm", ".gif"))]
     result = videos[0] if videos else (files[0] if files else None)
     if result is None:
+        log_run({**base, "status": "error", "error": "No output file produced.", "step": state["value"], "total_steps": max(state["max"], steps)})
         raise ComfyError("Generation finished but produced no output file.")
+    log_run({
+        **base, "status": "success", "step": steps, "total_steps": steps,
+        "output": os.path.basename(result),
+    })
     info = f"seed: {seed_used} · resolution: {width}x{height} · {frames} frames"
     return result, info
 
@@ -457,7 +528,10 @@ def gen_text_to_video(model_choice, prompt, negative, width, height, frames, ste
         else:
             g, images = build_wan_t2v(prompt, negative, width, height, frames, steps, cfg, seed_used)
             wan_save(g, images, fps)
-        path, info = run_and_collect(g, seed_used, width, height, frames, gr_progress=progress)
+        path, info = run_and_collect(
+            g, seed_used, width, height, frames, steps, cfg, fps, gr_progress=progress,
+            mode="Text to Video", model=model_choice, prompt_text=prompt,
+        )
     except ComfyError as e:
         raise gr.Error(str(e))
     return path, info
@@ -484,7 +558,10 @@ def gen_image_to_video(model_choice, image, prompt, negative, width, height, fra
         else:
             g, images = build_wan_reference(prompt, negative, width, height, frames, steps, cfg, seed_used, fname)
             wan_save(g, images, fps)
-        path, info = run_and_collect(g, seed_used, width, height, frames, gr_progress=progress)
+        path, info = run_and_collect(
+            g, seed_used, width, height, frames, steps, cfg, fps, gr_progress=progress,
+            mode="Image to Video", model=model_choice, prompt_text=prompt,
+        )
     except ComfyError as e:
         raise gr.Error(str(e))
     return path, info
@@ -515,7 +592,10 @@ def gen_compose(images, prompt, negative, width, height, frames, steps, cfg, see
         fname = client.upload_image(sheet)
         g, out_images = build_wan_reference(prompt, negative, width, height, frames, steps, cfg, seed_used, fname)
         wan_save(g, out_images, fps)
-        path, info = run_and_collect(g, seed_used, width, height, frames, gr_progress=progress)
+        path, info = run_and_collect(
+            g, seed_used, width, height, frames, steps, cfg, fps, gr_progress=progress,
+            mode="Compose & Animate", model="Wan", prompt_text=prompt,
+        )
     except ComfyError as e:
         raise gr.Error(str(e))
     return sheet, path, info
@@ -545,7 +625,10 @@ def gen_keyframes(images, prompt, negative, width, height, frames, steps, cfg, s
             negative, width, height, frames, steps, cfg, seed_used, fps, guides,
         )
         ltx_save(g, images_out, fps)
-        path, info = run_and_collect(g, seed_used, width, height, frames, gr_progress=progress)
+        path, info = run_and_collect(
+            g, seed_used, width, height, frames, steps, cfg, fps, gr_progress=progress,
+            mode="Keyframes", model="LTX", prompt_text=prompt,
+        )
     except ComfyError as e:
         raise gr.Error(str(e))
     return path, info
@@ -601,6 +684,72 @@ def switch_defaults(model_choice):
     w, h, f, s, c = model_defaults("ltx" if model_choice == "LTX" else "wan")
     fps = LTX_DEFAULTS["fps"] if model_choice == "LTX" else WAN_DEFAULTS["fps"]
     return w, h, f, s, c, fps
+
+
+def _fmt_time(ts):
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+
+
+def _status_label(rec):
+    status = rec.get("status", "?")
+    step, total = rec.get("step", 0), rec.get("total_steps", 0)
+    if status == "running":
+        # A 'running' row with no follow-up means the process died mid-run.
+        active_ids = set()
+        if client.is_up():
+            try:
+                q = client._get("/queue").json()
+                for item in q.get("queue_running", []) + q.get("queue_pending", []):
+                    active_ids.add(item[1])
+            except Exception:
+                pass
+        if rec.get("comfy_prompt_id") in active_ids:
+            return f"running ({step}/{total})"
+        return f"interrupted at {step}/{total} (process stopped)"
+    if status == "error":
+        return f"error at {step}/{total}"
+    if status == "success":
+        return f"done ({total} steps)"
+    return status
+
+
+def history_rows():
+    rows = []
+    for rec in read_runs(200):
+        rows.append([
+            _fmt_time(rec.get("ts", 0)),
+            rec.get("mode", ""),
+            rec.get("model", ""),
+            (rec.get("prompt") or "")[:60],
+            f"{rec.get('width','?')}x{rec.get('height','?')}",
+            rec.get("frames", ""),
+            _status_label(rec),
+            rec.get("output", "") or (rec.get("error", "") or "")[:60],
+        ])
+    return rows
+
+
+def history_output_choices():
+    names = []
+    for rec in read_runs(200):
+        out = rec.get("output")
+        if out and os.path.exists(os.path.join(OUTPUT_DIR, out)):
+            names.append(out)
+    return names
+
+
+def load_history_video(filename):
+    if not filename:
+        raise gr.Error("Pick a file from the dropdown first.")
+    path = os.path.join(OUTPUT_DIR, filename)
+    if not os.path.exists(path):
+        raise gr.Error(f"{filename} no longer exists in outputs/.")
+    return path
+
+
+def refresh_history():
+    choices = history_output_choices()
+    return history_rows(), gr.update(choices=choices, value=choices[0] if choices else None)
 
 
 # ---------------------------------------------------------------------------
@@ -735,6 +884,28 @@ def build_ui():
                 dd.change(lambda v, k=key: set_model_file(k, v), inputs=[dd], outputs=[])
                 dropdowns.append(dd)
             refresh_btn.click(refresh_model_dropdowns, outputs=dropdowns)
+
+        with gr.Tab("History"):
+            gr.Markdown(
+                "Every run (including ones that errored or got interrupted) is logged to "
+                "`runs.jsonl` so it survives ComfyUI restarts, app restarts, and page reloads."
+            )
+            hist_refresh_btn = gr.Button("Refresh")
+            hist_table = gr.Dataframe(
+                headers=["time", "tab", "model", "prompt", "resolution", "frames", "status", "output / error"],
+                datatype=["str"] * 8,
+                value=history_rows(),
+                interactive=False,
+                wrap=True,
+            )
+            with gr.Row():
+                hist_dropdown = gr.Dropdown(
+                    choices=history_output_choices(), label="Output file", scale=3,
+                )
+                hist_load_btn = gr.Button("Load", scale=1)
+            hist_video = gr.Video(label="Preview")
+            hist_refresh_btn.click(refresh_history, outputs=[hist_table, hist_dropdown])
+            hist_load_btn.click(load_history_video, inputs=[hist_dropdown], outputs=[hist_video])
 
     return demo
 

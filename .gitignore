@@ -1,4 +1,5 @@
 outputs/
+runs.jsonl
 venv/
 ComfyUI/
 __pycache__/
