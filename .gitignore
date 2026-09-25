@@ -1,0 +1,7 @@
+outputs/
+venv/
+ComfyUI/
+__pycache__/
+*.pyc
+.claude/
+.idea/
